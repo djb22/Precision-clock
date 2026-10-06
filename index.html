@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Self-Learning Precision Clock</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background-color: #050811; color: #e2e8f0; font-family: system-ui, -apple-system, sans-serif; }
+    .oled-mode { background-color: #000000 !important; }
+    .glow-text { text-shadow: 0 0 20px rgba(52, 211, 153, 0.4); }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col justify-between p-4 transition-colors duration-300">
+
+  <!-- STATUS HEADER -->
+  <div class="flex justify-between items-center max-w-md mx-auto w-full pt-2">
+    <div class="bg-gray-900/90 border border-gray-800 rounded-xl p-3 flex items-center space-x-3">
+      <div id="statusDot" class="w-3 h-3 rounded-full bg-amber-500 animate-pulse"></div>
+      <div>
+        <div id="statusTitle" class="text-xs font-semibold uppercase tracking-wider text-amber-400">Uncalibrated</div>
+        <div id="statusSub" class="text-[10px] text-gray-400">Add 2+ manual points to enable drift learning</div>
+      </div>
+    </div>
+
+    <button onclick="toggleOled()" class="bg-gray-900 border border-gray-800 px-3 py-2 rounded-xl text-xs text-gray-300">
+      🌙 OLED
+    </button>
+  </div>
+
+  <!-- MAIN CLOCK DISPLAY -->
+  <div class="flex flex-col items-center justify-center my-auto py-6">
+    <div id="clockDisplay" class="text-5xl sm:text-7xl font-mono font-bold tracking-tight text-white glow-text">
+      00:00:00<span id="msDisplay" class="text-2xl text-emerald-400 font-normal">.000</span>
+    </div>
+
+    <!-- ACTIVE ADJUSTMENT DISPLAY -->
+    <div class="mt-4 bg-emerald-950/40 border border-emerald-800/50 px-4 py-1.5 rounded-full text-xs text-emerald-400 flex items-center space-x-2">
+      <span>⚙️ Applied Offset:</span>
+      <span id="offsetVal" class="font-mono font-bold">+0.0 ms</span>
+    </div>
+
+    <div id="dateDisplay" class="mt-3 text-sm font-medium text-gray-400">Loading date...</div>
+    <div id="logConsole" class="mt-4 text-[11px] font-mono text-gray-400 max-w-xs text-center min-h-[1.5rem]">Ready.</div>
+  </div>
+
+  <!-- CALIBRATION CONTROLS -->
+  <div class="max-w-md mx-auto w-full space-y-2.5 pb-4">
+    <button onclick="promptManualOffset()" class="w-full bg-emerald-500 hover:bg-emerald-400 text-gray-950 font-bold py-3.5 rounded-2xl shadow-lg shadow-emerald-500/20 text-sm uppercase flex items-center justify-center space-x-2">
+      <span>✏️</span>
+      <span>Add Manual Offset Point (ms)</span>
+    </button>
+
+    <button onclick="promptTargetTime()" class="w-full bg-gray-900 border border-gray-800 hover:bg-gray-800 py-3 rounded-xl text-cyan-400 text-xs font-medium flex items-center justify-center space-x-2">
+      <span>🎯</span>
+      <span>Sync to External Reference Clock (HH:MM:SS)</span>
+    </button>
+
+    <!-- METRICS TELEMETRY -->
+    <div class="bg-gray-900/80 border border-gray-800 rounded-xl p-3 text-xs space-y-1 font-mono">
+      <div class="flex justify-between text-gray-400">
+        <span>Hardware Speed Error:</span>
+        <span id="driftRateVal" class="text-emerald-400 font-bold">0.00 ms/day</span>
+      </div>
+      <div class="flex justify-between text-gray-400">
+        <span>Crystal Error Rate:</span>
+        <span id="ppmVal" class="text-cyan-400 font-bold">0.00 PPM</span>
+      </div>
+      <div class="flex justify-between text-gray-400">
+        <span>Stored Calibration Points:</span>
+        <span id="savedCountVal" class="text-gray-200">0</span>
+      </div>
+    </div>
+
+    <!-- CALIBRATION HISTORY LIST WITH DATES -->
+    <div class="bg-gray-900/40 border border-gray-800/80 rounded-xl p-3 text-xs">
+      <div class="font-semibold text-gray-300 mb-1">Stored Calibration History:</div>
+      <div id="historyList" class="space-y-1.5 font-mono text-[11px] max-h-32 overflow-y-auto text-gray-400">
+        No points saved yet.
+      </div>
+    </div>
+
+    <button onclick="clearHistory()" class="w-full text-center text-rose-400 hover:underline text-xs pt-1">
+      Clear Calibration History & Reset
+    </button>
+  </div>
+
+  <script>
+    const STORAGE_KEY = "precision_clock_sync_points_v3";
+    let syncHistory = [];
+    let calculatedPpm = 0; // Positive = Hardware is FAST, Negative = Hardware is SLOW
+    let baseOffsetMs = 0;
+    let baseTimestamp = 0;
+
+    function init() {
+      loadHistory();
+      setInterval(updateClock, 16);
+    }
+
+    function loadHistory() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        syncHistory = raw ? JSON.parse(raw) : [];
+      } catch (e) {
+        syncHistory = [];
+      }
+      recalculateDriftModel();
+    }
+
+    function saveHistory() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(syncHistory));
+      recalculateDriftModel();
+    }
+
+    function clearHistory() {
+      if (confirm("Reset all saved calibration data?")) {
+        localStorage.removeItem(STORAGE_KEY);
+        syncHistory = [];
+        recalculateDriftModel();
+        log("History cleared.");
+      }
+    }
+
+    // DRIFT MODEL (CORRECT POLARITY)
+    function recalculateDriftModel() {
+      document.getElementById('savedCountVal').innerText = syncHistory.length;
+      renderHistoryList();
+
+      if (syncHistory.length === 0) {
+        calculatedPpm = 0;
+        baseOffsetMs = 0;
+        baseTimestamp = Date.now();
+        updateStatus(false);
+        return;
+      }
+
+      const lastSync = syncHistory[syncHistory.length - 1];
+      baseOffsetMs = lastSync.offset;
+      baseTimestamp = lastSync.timestamp;
+
+      if (syncHistory.length < 2) {
+        calculatedPpm = 0;
+        updateStatus(false);
+        return;
+      }
+
+      // Hardware Drift Rate Calculation
+      // If offset drops over time (+100ms -> +50ms), hardware is ticking TOO FAST (gaining time).
+      const firstSync = syncHistory[0];
+      const totalElapsedSec = (lastSync.timestamp - firstSync.timestamp) / 1000;
+
+      if (totalElapsedSec > 0) {
+        const offsetDeltaMs = lastSync.offset - firstSync.offset;
+        // Invert delta: decreasing offset means clock runs fast (positive hardware error)
+        const hardwareDriftRatio = -(offsetDeltaMs / 1000) / totalElapsedSec;
+        calculatedPpm = hardwareDriftRatio * 1_000_000;
+      } else {
+        calculatedPpm = 0;
+      }
+
+      updateStatus(true);
+    }
+
+    function getCorrectedTime() {
+      const now = Date.now();
+      if (syncHistory.length === 0) return { time: now, offset: 0 };
+
+      const elapsedSec = (now - baseTimestamp) / 1000;
+      // Subtract accumulated hardware drift to keep the clock pulled back to true atomic time
+      const predictedDriftMs = elapsedSec * (calculatedPpm / 1000);
+      const totalOffsetMs = baseOffsetMs - predictedDriftMs;
+
+      return { time: now + totalOffsetMs, offset: totalOffsetMs };
+    }
+
+    function updateClock() {
+      const { time, offset } = getCorrectedTime();
+      const d = new Date(time);
+
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      const ms = String(d.getMilliseconds()).padStart(3, '0');
+
+      document.getElementById('clockDisplay').childNodes[0].nodeValue = `${hh}:${mm}:${ss}`;
+      document.getElementById('msDisplay').innerText = `.${ms}`;
+      document.getElementById('offsetVal').innerText = `${offset >= 0 ? '+' : ''}${offset.toFixed(1)} ms`;
+
+      const options = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
+      document.getElementById('dateDisplay').innerText = d.toLocaleDateString(undefined, options);
+    }
+
+    function promptManualOffset() {
+      const input = prompt("Enter current clock offset in milliseconds (e.g. -100 if clock is 100ms fast):", "0");
+      if (input !== null) {
+        const offset = parseFloat(input);
+        if (!isNaN(offset)) {
+          recordSyncPoint(offset);
+          log(`Saved offset point: ${offset >= 0 ? '+' : ''}${offset} ms`);
+        }
+      }
+    }
+
+    function promptTargetTime() {
+      const input = prompt("Enter exact reference clock time (HH:MM:SS):", "12:00:00");
+      if (input) {
+        const parts = input.split(':');
+        if (parts.length === 3) {
+          const now = new Date();
+          const targetTime = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate(),
+            parseInt(parts[0], 10),
+            parseInt(parts[1], 10),
+            parseInt(parts[2], 10)
+          ).getTime();
+
+          const offsetMs = targetTime - now.getTime();
+          recordSyncPoint(offsetMs);
+          log(`Synced to ${input} (Calculated Offset: ${offsetMs >= 0 ? '+' : ''}${offsetMs} ms)`);
+        }
+      }
+    }
+
+    function recordSyncPoint(offsetMs) {
+      syncHistory.push({
+        timestamp: Date.now(),
+        offset: offsetMs
+      });
+      saveHistory();
+    }
+
+    function renderHistoryList() {
+      const container = document.getElementById('historyList');
+      if (syncHistory.length === 0) {
+        container.innerText = "No calibration points stored yet.";
+        return;
+      }
+      container.innerHTML = syncHistory.map((item, i) => {
+        const dateObj = new Date(item.timestamp);
+        const formattedDate = dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+        const formattedTime = dateObj.toLocaleTimeString();
+
+        return `
+          <div class="flex justify-between items-center border-b border-gray-800/60 pb-1">
+            <div class="flex flex-col">
+              <span class="text-gray-300 font-semibold">Point #${i + 1}</span>
+              <span class="text-[10px] text-gray-400">${formattedDate} at ${formattedTime}</span>
+            </div>
+            <span class="${item.offset >= 0 ? 'text-emerald-400' : 'text-rose-400'} font-bold">
+              ${item.offset >= 0 ? '+' : ''}${item.offset.toFixed(1)} ms
+            </span>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function updateStatus(calibrated) {
+      const dot = document.getElementById('statusDot');
+      const title = document.getElementById('statusTitle');
+      const sub = document.getElementById('statusSub');
+
+      if (calibrated) {
+        dot.className = "w-3 h-3 rounded-full bg-emerald-400";
+        title.innerText = "Calibrated & Compensating";
+        title.className = "text-xs font-semibold uppercase tracking-wider text-emerald-400";
+        sub.innerText = "Learned drift model active (Offline)";
+      } else {
+        dot.className = "w-3 h-3 rounded-full bg-amber-500 animate-pulse";
+        title.innerText = "Uncalibrated";
+        title.className = "text-xs font-semibold uppercase tracking-wider text-amber-400";
+        sub.innerText = `Add ${Math.max(0, 2 - syncHistory.length)} more point(s) to learn drift rate`;
+      }
+
+      const msPerDay = calculatedPpm * 86.4;
+      const polarityText = calculatedPpm > 0 ? " (FAST)" : calculatedPpm < 0 ? " (SLOW)" : "";
+      document.getElementById('driftRateVal').innerText = `${msPerDay >= 0 ? '+' : ''}${msPerDay.toFixed(2)} ms/day${polarityText}`;
+      document.getElementById('ppmVal').innerText = `${calculatedPpm >= 0 ? '+' : ''}${calculatedPpm.toFixed(2)} PPM`;
+    }
+
+    function log(msg) {
+      document.getElementById('logConsole').innerText = msg;
+    }
+
+    function toggleOled() {
+      document.body.classList.toggle('oled-mode');
+    }
+
+    init();
+  </script>
+</body>
+</html>
